@@ -6,7 +6,7 @@ One run collects the data once and passes it to the components you choose:
 
 | Component | Writes | For |
 |---|---|---|
-| `json` | `pulse.json` | Tools and later aggregation. The full report model, see [docs/json-output.md](docs/json-output.md). |
+| `json` | `pulse.json` | Tools and later aggregation. The full report model, see [documentation/json-output.md](documentation/json-output.md). |
 | `html` | `index.html` | People. A single self-contained page (no external assets, light and dark mode) ready for GitHub Pages. |
 | `agent` | `pulse.md` | Agents. Dense Markdown with stable references, description excerpts and recent comments, so an agent can write the narrative. |
 | `step-summary` | the run's job summary | A quick look on the workflow run page. |

@@ -481,7 +481,7 @@ import { writeFile as writeFile3 } from "node:fs/promises";
 import { join as join3 } from "node:path";
 var jsonComponent = {
   name: "json",
-  description: "Structured report as pulse.json (schema in docs/json-output.md).",
+  description: "Structured report as pulse.json (schema in documentation/json-output.md).",
   async run(report, { outputDirectory }) {
     const file = join3(outputDirectory, "pulse.json");
     await writeFile3(file, JSON.stringify(report, null, 2) + "\n");

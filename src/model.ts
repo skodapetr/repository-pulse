@@ -1,7 +1,7 @@
 /**
  * The report model. This is exactly what the `json` component writes, so it
  * doubles as the output contract. Bump SCHEMA_VERSION on breaking changes and
- * keep docs/json-output.md in sync.
+ * keep documentation/json-output.md in sync.
  */
 
 export const SCHEMA_VERSION = 1;
