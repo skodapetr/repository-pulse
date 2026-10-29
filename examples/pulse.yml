@@ -1,0 +1,57 @@
+# Example consumer workflow: put this in .github/workflows/ of a repository
+# you own (for example a "pulse" repository), enable GitHub Pages with
+# "Source: GitHub Actions", and the report is rebuilt every morning.
+
+name: Repository pulse
+
+on:
+  schedule:
+    - cron: '17 5 * * *' # daily at 05:17 UTC
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Window length in days
+        default: '7'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pulse
+  cancel-in-progress: true
+
+jobs:
+  pulse:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Build the report
+        id: pulse
+        uses: skodapetr/repository-pulse@v1
+        with:
+          repositories: |
+            dataspecer/dataspecer
+            dataspecer/ci-specifications
+          components: json, html, agent, step-summary
+          days: ${{ inputs.days || '7' }}
+          output-directory: site
+          title: Dataspecer pulse
+
+      # Keep the files of every run for 90 days, so agents can fetch them.
+      - name: Keep the files as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulse-${{ github.run_id }}
+          path: site
+
+      - name: Publish to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

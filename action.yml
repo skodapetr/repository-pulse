@@ -1,0 +1,73 @@
+name: Repository Pulse
+description: Report what happened in a set of repositories over a time window, as a web page, structured JSON and agent-ready Markdown.
+branding:
+  icon: activity
+  color: blue
+
+inputs:
+  repositories:
+    description: >
+      Repositories to report on, as owner/name. One per line, comma separated,
+      or as a YAML-style "- owner/name" list. Lines starting with # are ignored.
+    required: true
+  components:
+    description: >
+      Outputs to produce, in order. Available: json, html, agent, step-summary.
+      See the README for what each one writes.
+    required: false
+    default: json, html, agent
+  days:
+    description: Length of the time window in days, ending at `until`. Ignored when `since` is set.
+    required: false
+    default: '7'
+  since:
+    description: Start of the window (inclusive), as YYYY-MM-DD or an ISO 8601 timestamp. Overrides `days`.
+    required: false
+    default: ''
+  until:
+    description: End of the window (exclusive), as YYYY-MM-DD or an ISO 8601 timestamp. Defaults to the time of the run.
+    required: false
+    default: ''
+  output-directory:
+    description: Directory the components write into. Created if missing.
+    required: false
+    default: repository-pulse
+  token:
+    description: >
+      Token used to read the repositories. The default workflow token can read public
+      repositories and the repository the workflow runs in; use a personal access token
+      or a GitHub App token for private repositories elsewhere.
+    required: false
+    default: ${{ github.token }}
+  ignore-users:
+    description: >
+      Extra logins to treat as bots, in addition to accounts of type Bot and logins ending
+      in "[bot]" or "-bot". Their comments, reviews and commits are left out.
+    required: false
+    default: ''
+  title:
+    description: Title used in the HTML page, the Markdown file and the step summary.
+    required: false
+    default: Repository pulse
+
+outputs:
+  output-directory:
+    description: Absolute path of the output directory.
+  files:
+    description: Paths of all files written, one per line.
+  json-file:
+    description: Path of pulse.json, when the json component ran.
+  html-file:
+    description: Path of index.html, when the html component ran.
+  agent-file:
+    description: Path of pulse.md, when the agent component ran.
+  since:
+    description: Resolved start of the window (ISO 8601, UTC).
+  until:
+    description: Resolved end of the window (ISO 8601, UTC).
+  waiting-count:
+    description: Number of open items where someone is expected to act.
+
+runs:
+  using: node24
+  main: dist/action.js
