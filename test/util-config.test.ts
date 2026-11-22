@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildConfig, makeIgnoreFilter, parseList, parseWindow } from '../src/config.js';
+import { buildConfig, makeIgnoreFilter, parseLimit, parseList, parseViewer, parseWindow } from '../src/config.js';
 import { excerpt, inWindow, mentions } from '../src/util.js';
 
 test('mentions skip code, quotes, e-mails and teams', () => {
@@ -44,10 +44,10 @@ test('window from days and explicit dates', () => {
 });
 
 test('config validates repositories and components', () => {
-  const known = ['json', 'html', 'agent', 'step-summary'];
+  const known = ['json', 'agent', 'step-summary'];
   const c = buildConfig({ repositories: 'https://github.com/o/r.git\no/r' }, known);
   assert.deepEqual(c.repositories, ['o/r']);
-  assert.deepEqual(c.components, ['json', 'html', 'agent']);
+  assert.deepEqual(c.components, ['json', 'agent']);
   assert.deepEqual(buildConfig({ repositories: 'o/r', components: 'agent, JSON' }, known).components, ['agent', 'json']);
   assert.throws(() => buildConfig({ repositories: 'o/r', components: 'pdf' }, ['json']), /Unknown component/);
   assert.throws(() => buildConfig({ repositories: '' }, ['json']), /No repositories/);
@@ -63,4 +63,30 @@ test('bot detection', () => {
   assert.ok(!isIgnored('robot-arm'));
   assert.ok(!isIgnored('abbott'));
   assert.deepEqual([...seen].sort(), ['CI-Helper', 'dataspecer-bot', 'dependabot[bot]', 'someone']);
+});
+
+test('html component is rejected with a pointer to the viewer', () => {
+  assert.throws(() => buildConfig({ repositories: 'o/r', components: 'json, html' }, ['json', 'agent']), /viewer/);
+});
+
+test('history limits, viewer and restore url', () => {
+  const known = ['json', 'agent'];
+  const defaults = buildConfig({ repositories: 'o/r' }, known);
+  assert.deepEqual(defaults.retention, { days: -1, count: -1 });
+  assert.deepEqual(defaults.viewer, { kind: 'default' });
+  assert.equal(defaults.restoreUrl, undefined);
+
+  const c = buildConfig(
+    { repositories: 'o/r', 'history-days': '30', 'history-count': '-1', viewer: 'https://x.test/v.js', 'restore-url': 'https://o.github.io/r/' },
+    known,
+  );
+  assert.deepEqual(c.retention, { days: 30, count: -1 });
+  assert.deepEqual(c.viewer, { kind: 'url', url: 'https://x.test/v.js' });
+  assert.equal(c.restoreUrl, 'https://o.github.io/r/');
+
+  assert.deepEqual(parseViewer('none'), { kind: 'none' });
+  assert.deepEqual(parseViewer(' my/viewer.js '), { kind: 'file', path: 'my/viewer.js' });
+  assert.throws(() => parseViewer('http://x.test/v.js'), /https/);
+  for (const bad of ['0', '1.5', '-2', 'abc']) assert.throws(() => parseLimit(bad, 'history-days'), /history-days/);
+  assert.throws(() => buildConfig({ repositories: 'o/r', 'restore-url': 'ftp://x' }, known), /restore-url/);
 });

@@ -9,7 +9,19 @@ export interface Config {
   apiUrl?: string;
   ignoreUsers: string[];
   title: string;
+  /** How many reports to keep, see history.ts. -1 means no limit. */
+  retention: { days: number; count: number };
+  viewer: ViewerSetting;
+  /** Published site to download earlier reports from before running. */
+  restoreUrl?: string;
 }
+
+/** Where index.html gets its viewer from. */
+export type ViewerSetting =
+  | { kind: 'default' }
+  | { kind: 'none' }
+  | { kind: 'file'; path: string }
+  | { kind: 'url'; url: string };
 
 /** Raw string inputs, as they come from action inputs or CLI flags. */
 export interface RawInputs {
@@ -23,9 +35,13 @@ export interface RawInputs {
   'api-url'?: string;
   'ignore-users'?: string;
   title?: string;
+  'history-days'?: string;
+  'history-count'?: string;
+  viewer?: string;
+  'restore-url'?: string;
 }
 
-export const DEFAULT_COMPONENTS = ['json', 'html', 'agent'];
+export const DEFAULT_COMPONENTS = ['json', 'agent'];
 
 /** Split a list given as lines, commas or a YAML-style "- item" list. Lines starting with # are comments. */
 export function parseList(value: string | undefined): string[] {
@@ -77,12 +93,44 @@ export function parseWindow(raw: { days?: string; since?: string; until?: string
   };
 }
 
+/** A whole number of at least 1, or -1 (also empty) for no limit. */
+export function parseLimit(value: string | undefined, name: string): number {
+  const trimmed = value?.trim();
+  if (!trimmed) return -1;
+  const number = Number(trimmed);
+  if (!Number.isInteger(number) || (number < 1 && number !== -1)) {
+    throw new Error(`Invalid ${name} "${value}". Use a whole number of at least 1, or -1 to keep everything.`);
+  }
+  return number;
+}
+
+function parseRestoreUrl(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  if (!/^https?:\/\/[^\s/]+/i.test(trimmed)) throw new Error(`Invalid restore-url "${value}". Use the address of the published site, starting with https://.`);
+  return trimmed;
+}
+
+export function parseViewer(value: string | undefined): ViewerSetting {
+  const trimmed = value?.trim() ?? '';
+  if (!trimmed || trimmed.toLowerCase() === 'default') return { kind: 'default' };
+  if (trimmed.toLowerCase() === 'none') return { kind: 'none' };
+  if (/^https:\/\//i.test(trimmed)) return { kind: 'url', url: trimmed };
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) throw new Error(`Invalid viewer "${value}". URLs must use https.`);
+  return { kind: 'file', path: trimmed };
+}
+
 export function buildConfig(raw: RawInputs, knownComponents: string[], now = new Date()): Config {
   const repositories = [...new Set(parseList(raw.repositories).map(parseRepository))];
   if (repositories.length === 0) throw new Error('No repositories given. Set the "repositories" input.');
 
   const components = parseList(raw.components).map((c) => c.toLowerCase());
   const selected = components.length ? [...new Set(components)] : DEFAULT_COMPONENTS;
+  if (selected.includes('html')) {
+    throw new Error(
+      'The "html" component was replaced by the viewer: reports are now pulse/DATE.json and pulse/DATE.md, and index.html is a viewer that renders the JSON in the browser. Remove "html" from components; see the "viewer" input.',
+    );
+  }
   const unknown = selected.filter((c) => !knownComponents.includes(c));
   if (unknown.length) {
     throw new Error(`Unknown component(s): ${unknown.join(', ')}. Available: ${knownComponents.join(', ')}.`);
@@ -97,6 +145,9 @@ export function buildConfig(raw: RawInputs, knownComponents: string[], now = new
     apiUrl: raw['api-url']?.trim() || undefined,
     ignoreUsers: parseList(raw['ignore-users']),
     title: raw.title?.trim() || 'Repository pulse',
+    retention: { days: parseLimit(raw['history-days'], 'history-days'), count: parseLimit(raw['history-count'], 'history-count') },
+    viewer: parseViewer(raw.viewer),
+    restoreUrl: parseRestoreUrl(raw['restore-url']),
   };
 }
 

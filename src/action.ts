@@ -17,6 +17,10 @@ const INPUTS: Array<keyof RawInputs> = [
   'api-url',
   'ignore-users',
   'title',
+  'history-days',
+  'history-count',
+  'viewer',
+  'restore-url',
 ];
 
 function input(name: string): string | undefined {
@@ -45,8 +49,9 @@ async function main(): Promise<void> {
   setOutput('output-directory', resolve(config.outputDirectory));
   setOutput('files', all.join('\n'));
   setOutput('json-file', result.files.json?.[0] ?? '');
-  setOutput('html-file', result.files.html?.[0] ?? '');
   setOutput('agent-file', result.files.agent?.[0] ?? '');
+  setOutput('manifest-file', result.files.manifest?.[0] ?? '');
+  setOutput('viewer-file', result.files.viewer?.[0] ?? '');
   setOutput('since', config.window.since);
   setOutput('until', config.window.until);
   setOutput('waiting-count', String(result.report.waiting.length));

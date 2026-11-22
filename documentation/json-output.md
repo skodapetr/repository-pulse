@@ -1,6 +1,6 @@
 # `pulse.json` format
 
-The `json` component writes the report model as it is, so this file is also the contract for anything built on top of the action. The TypeScript definitions in [`src/model.ts`](../src/model.ts) are the source of truth. `schemaVersion` goes up when a change breaks existing readers. Adding fields does not count as breaking.
+The `json` component writes the report model as it is, to `pulse/YYYY-MM-DD.json` (the day the window ends; the files and their dates are listed in [manifest.json](manifest.md)), so this file is also the contract for anything built on top of the action. The TypeScript definitions in [`src/model.ts`](../src/model.ts) are the source of truth. `schemaVersion` goes up when a change breaks existing readers. Adding fields does not count as breaking.
 
 Conventions:
 

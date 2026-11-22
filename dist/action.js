@@ -6,8 +6,136 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 
 // src/components/agent.ts
-import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir as mkdir2, writeFile as writeFile2 } from "node:fs/promises";
+import { join as join2 } from "node:path";
+
+// src/history.ts
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+
+// src/model.ts
+var SCHEMA_VERSION = 1;
+var MANIFEST_VERSION = 1;
+
+// src/history.ts
+var MANIFEST_FILE = "manifest.json";
+var REPORT_DIRECTORY = "pulse";
+function reportDate(window) {
+  return window.until.slice(0, 10);
+}
+function reportPath(kind, date) {
+  return `${REPORT_DIRECTORY}/${date}.${kind === "json" ? "json" : "md"}`;
+}
+var DATE = /^\d{4}-\d{2}-\d{2}$/;
+function isEntry(value) {
+  const e = value;
+  return !!e && typeof e.date === "string" && DATE.test(e.date) && typeof e.generatedAt === "string" && typeof e.title === "string" && !!e.window && !!e.files && typeof e.files === "object";
+}
+function parseManifest(text, source = MANIFEST_FILE) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`${source} is not valid JSON. Fix or delete it; refusing to continue because that would lose the history.`);
+  }
+  if (!data || typeof data !== "object" || !Array.isArray(data.reports)) {
+    throw new Error(`${source} is not a manifest (no "reports" list).`);
+  }
+  if (data.schemaVersion !== MANIFEST_VERSION) {
+    throw new Error(`${source} has schemaVersion ${data.schemaVersion}, this version understands ${MANIFEST_VERSION}.`);
+  }
+  if (!data.reports.every(isEntry)) throw new Error(`${source} has malformed report entries.`);
+  return normalize(data.reports);
+}
+function normalize(entries) {
+  const byDate = /* @__PURE__ */ new Map();
+  for (const entry of entries) byDate.set(entry.date, entry);
+  const reports = [...byDate.values()].sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : 0);
+  return { schemaVersion: MANIFEST_VERSION, latest: reports[0]?.date ?? "", reports };
+}
+async function loadManifest(directory) {
+  let text;
+  try {
+    text = await readFile(join(directory, MANIFEST_FILE), "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return normalize([]);
+    throw error;
+  }
+  return parseManifest(text, join(directory, MANIFEST_FILE));
+}
+async function exists(path) {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function dropMissing(manifest, directory, log) {
+  const kept = [];
+  for (const entry of manifest.reports) {
+    const files = Object.values(entry.files);
+    const present = await Promise.all(files.map((f) => exists(join(directory, f))));
+    if (files.length > 0 && present.every(Boolean)) kept.push(entry);
+    else log(`history: dropping ${entry.date} from the manifest, its files are missing.`);
+  }
+  return normalize(kept);
+}
+function upsert(manifest, entry) {
+  return normalize([...manifest.reports.filter((e) => e.date !== entry.date), entry]);
+}
+function prune(manifest, retention) {
+  const [newest, ...older] = manifest.reports;
+  if (!newest) return { manifest, removed: [] };
+  const newestMs = Date.parse(`${newest.date}T00:00:00Z`);
+  const kept = [newest];
+  const removed = [];
+  older.forEach((entry, index) => {
+    const ageDays = (newestMs - Date.parse(`${entry.date}T00:00:00Z`)) / 864e5;
+    const tooOld = retention.days >= 0 && ageDays > retention.days;
+    const tooMany = retention.count >= 0 && index + 2 > retention.count;
+    (tooOld || tooMany ? removed : kept).push(entry);
+  });
+  return { manifest: normalize(kept), removed };
+}
+async function writeManifest(directory, manifest) {
+  const file = join(directory, MANIFEST_FILE);
+  const temporary = `${file}.tmp`;
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(temporary, JSON.stringify(manifest, null, 2) + "\n");
+  await rename(temporary, file);
+  return file;
+}
+async function removeReportFiles(directory, entries) {
+  for (const entry of entries) {
+    for (const file of Object.values(entry.files)) await rm(join(directory, file), { force: true });
+  }
+}
+async function restoreFromUrl(base, directory, log, fetchFn = (url) => fetch(url)) {
+  const root = base.endsWith("/") ? base : `${base}/`;
+  const response = await fetchFn(new URL(MANIFEST_FILE, root).href);
+  if (response.status === 404) {
+    log(`restore: no ${MANIFEST_FILE} at ${root}, starting a new history.`);
+    return;
+  }
+  if (!response.ok) throw new Error(`restore: ${root}${MANIFEST_FILE} answered HTTP ${response.status}.`);
+  const manifest = parseManifest(await response.text(), `${root}${MANIFEST_FILE}`);
+  let count = 0;
+  for (const entry of manifest.reports) {
+    for (const file of Object.values(entry.files)) {
+      const target = join(directory, file);
+      if (await exists(target)) continue;
+      const res = await fetchFn(new URL(file, root).href);
+      if (!res.ok) throw new Error(`restore: ${root}${file} answered HTTP ${res.status}.`);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, await res.text());
+      count++;
+    }
+  }
+  await mkdir(directory, { recursive: true });
+  await writeManifest(directory, manifest);
+  log(`restore: ${manifest.reports.length} reports in the history, downloaded ${count} files from ${root}`);
+}
 
 // src/util.ts
 function ts(value) {
@@ -53,13 +181,30 @@ function byTime(get) {
 // src/components/agent.ts
 var agentComponent = {
   name: "agent",
-  description: "Agent-ready Markdown as pulse.md: all facts, stable references, excerpts of descriptions and comments.",
+  description: "Agent-ready Markdown as pulse/DATE.md (facts, stable references, excerpts) and pulse.md, the instructions for finding the latest report.",
   async run(report, { outputDirectory, title }) {
-    const file = join(outputDirectory, "pulse.md");
-    await writeFile(file, renderAgentMarkdown(report, title));
-    return [file];
+    const file = join2(outputDirectory, reportPath("markdown", reportDate(report.window)));
+    await mkdir2(join2(file, ".."), { recursive: true });
+    await writeFile2(file, renderAgentMarkdown(report, title));
+    const entry = join2(outputDirectory, "pulse.md");
+    await writeFile2(entry, renderAgentEntry(title));
+    return [file, entry];
   }
 };
+function renderAgentEntry(title = "Repository pulse") {
+  return `# ${title}: instructions for agents
+
+This site publishes a report of repository activity (issues, pull requests, commits, discussions, contributors and who is waiting on whom) once per day. Each report covers a time window and is kept as a separate file.
+
+To read the latest report:
+
+1. Fetch \`${MANIFEST_FILE}\` from the same directory as this file. It is JSON: \`{ "latest": "YYYY-MM-DD", "reports": [...] }\`, newest report first.
+2. Take \`reports[0]\` (its \`date\` equals \`latest\`). \`window\` gives the period it covers. \`files.markdown\` is the path of the report written for agents, \`files.json\` the same data as structured JSON. Paths are relative to the manifest.
+3. Fetch \`files.markdown\` and base your summary on it. Its first lines explain how to read references and what the totals mean.
+
+To compare with earlier periods, pick other entries in \`reports\` and fetch their files the same way. Not every period has a report, and old ones are removed according to the retention settings, so use the dates listed in the manifest instead of guessing file names.
+`;
+}
 var quote = (text) => text ? `  > ${text}` : "";
 function renderAgentMarkdown(report, title = "Repository pulse") {
   const out = [];
@@ -69,6 +214,7 @@ function renderAgentMarkdown(report, title = "Repository pulse") {
     "",
     `- Window: ${w.since} to ${w.until} (${w.days} days, end exclusive, UTC)`,
     `- Generated: ${report.generatedAt} by ${report.generator.name} ${report.generator.version}`,
+    `- All reports: [../${MANIFEST_FILE}](../${MANIFEST_FILE})`,
     `- Repositories: ${report.repositories.map((r) => r.name).join(", ")}`,
     `- Excluded as bots or ignored: ${report.ignoredUsers.join(", ") || "none"}`,
     "",
@@ -185,310 +331,43 @@ function commitGroups(commits, directLabel) {
     groups.set(key, [...groups.get(key) ?? [], c]);
   }
   const out = [];
-  for (const [key, list2] of groups) {
-    out.push(`- ${key.startsWith("#") ? `via ${key}` : key}: ${list2.length} commit${list2.length === 1 ? "" : "s"}`);
-    for (const c of list2) out.push(`  - ${day(c.date)} ${c.author} ${c.sha.slice(0, 7)} ${c.message}`);
+  for (const [key, list] of groups) {
+    out.push(`- ${key.startsWith("#") ? `via ${key}` : key}: ${list.length} commit${list.length === 1 ? "" : "s"}`);
+    for (const c of list) out.push(`  - ${day(c.date)} ${c.author} ${c.sha.slice(0, 7)} ${c.message}`);
   }
   return out;
 }
 function contributorLines(c, multiRepo) {
-  const ref2 = (x) => multiRepo ? `${x.repository}#${x.number}` : `#${x.number}`;
-  const refs2 = (list2) => list2.map((x) => `${ref2(x)} "${x.title}"`).join("; ");
+  const ref = (x) => multiRepo ? `${x.repository}#${x.number}` : `#${x.number}`;
+  const refs = (list) => list.map((x) => `${ref(x)} "${x.title}"`).join("; ");
   const out = [`### ${c.login}${c.isLogin ? "" : " (git author name, no linked account)"}`, ""];
   if (multiRepo) out.push(`- Repositories: ${c.repositories.join(", ")}`);
   if (c.commits.length) {
     out.push(
-      `- Commits (${c.commits.length}): ` + c.commits.map((x) => `${x.message}${x.pullRequest ? ` [${ref2({ repository: x.repository, number: x.pullRequest })}]` : ""}`).join("; ")
+      `- Commits (${c.commits.length}): ` + c.commits.map((x) => `${x.message}${x.pullRequest ? ` [${ref({ repository: x.repository, number: x.pullRequest })}]` : ""}`).join("; ")
     );
   }
-  if (c.pullRequestsOpened.length) out.push(`- Pull requests opened: ${refs2(c.pullRequestsOpened)}`);
-  if (c.pullRequestsMerged.length) out.push(`- Own pull requests merged: ${refs2(c.pullRequestsMerged)}`);
-  if (c.pullRequestsMergedForOthers.length) out.push(`- Merged for others: ${refs2(c.pullRequestsMergedForOthers)}`);
-  if (c.reviews.length) out.push(`- Reviews: ${c.reviews.map((r) => `${ref2(r)} ${r.state.toLowerCase()}`).join("; ")}`);
-  if (c.issuesOpened.length) out.push(`- Issues opened: ${refs2(c.issuesOpened)}`);
-  if (c.issuesClosed.length) out.push(`- Issues closed: ${refs2(c.issuesClosed)}`);
-  if (c.comments.length) out.push(`- Comments: ${c.comments.map((x) => `${ref2(x)} \xD7${x.count}`).join("; ")}`);
-  if (c.waitingOn.length) out.push(`- Expected to act on: ${refs2(c.waitingOn)}`);
+  if (c.pullRequestsOpened.length) out.push(`- Pull requests opened: ${refs(c.pullRequestsOpened)}`);
+  if (c.pullRequestsMerged.length) out.push(`- Own pull requests merged: ${refs(c.pullRequestsMerged)}`);
+  if (c.pullRequestsMergedForOthers.length) out.push(`- Merged for others: ${refs(c.pullRequestsMergedForOthers)}`);
+  if (c.reviews.length) out.push(`- Reviews: ${c.reviews.map((r) => `${ref(r)} ${r.state.toLowerCase()}`).join("; ")}`);
+  if (c.issuesOpened.length) out.push(`- Issues opened: ${refs(c.issuesOpened)}`);
+  if (c.issuesClosed.length) out.push(`- Issues closed: ${refs(c.issuesClosed)}`);
+  if (c.comments.length) out.push(`- Comments: ${c.comments.map((x) => `${ref(x)} \xD7${x.count}`).join("; ")}`);
+  if (c.waitingOn.length) out.push(`- Expected to act on: ${refs(c.waitingOn)}`);
   if (c.activity === 0) out.push("- No activity in the window.");
   return out;
 }
 
-// src/components/html.ts
-import { writeFile as writeFile2 } from "node:fs/promises";
-import { join as join2 } from "node:path";
-var htmlComponent = {
-  name: "html",
-  description: "Self-contained web page as index.html (no external assets, light and dark mode).",
-  async run(report, { outputDirectory, title }) {
-    const file = join2(outputDirectory, "index.html");
-    await writeFile2(file, renderHtml(report, title));
-    return [file];
-  }
-};
-var STYLE = `
-:root{--bg:#fafaf9;--surface:#fff;--text:#1c1917;--muted:#6b6560;--line:#e7e5e4;--accent:#2457c5;--accent-soft:#e8eefb;
---ok:#1f7a4d;--ok-soft:#e5f3eb;--warn:#a15c07;--warn-soft:#fbf0de;--bad:#b42318;--bad-soft:#fdecea;
---mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-@media (prefers-color-scheme:dark){:root{--bg:#141312;--surface:#1d1c1a;--text:#ece9e6;--muted:#a19c96;--line:#2f2d2a;
---accent:#7fa6f5;--accent-soft:#1c2740;--ok:#6cc79a;--ok-soft:#16291f;--warn:#e4a64e;--warn-soft:#2e2414;--bad:#f08a80;--bad-soft:#331a17}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 var(--sans)}
-main{max-width:920px;margin:0 auto;padding:32px 16px 64px}
-header h1{font-size:26px;margin:0 0 4px;letter-spacing:-.01em}
-header p{margin:2px 0;color:var(--muted)}
-h2{font-size:20px;margin:44px 0 12px;padding-top:8px;border-top:1px solid var(--line)}
-h3{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:26px 0 10px;font-weight:600}
-a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
-code{font:13px var(--mono);background:var(--accent-soft);padding:1px 5px;border-radius:4px}
-.num{font-family:var(--mono);font-size:13px}
-.muted{color:var(--muted)}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-.stat{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
-.stat .v{font:600 22px var(--mono)}.stat .l{color:var(--muted);font-size:13px}.stat .d{font:12px var(--mono);color:var(--muted);margin-top:2px}
-.list{background:var(--surface);border:1px solid var(--line);border-radius:8px;margin:0;padding:0;list-style:none}
-.list>li{padding:10px 16px;border-top:1px solid var(--line);display:flex;gap:12px;align-items:baseline}
-.list>li:first-child{border-top:0}
-.list .ref{flex:0 0 auto;min-width:56px}
-.list .body{min-width:0;flex:1}
-.meta{color:var(--muted);font-size:13px}
-.excerpt{color:var(--muted);font-size:13px;margin-top:2px;overflow-wrap:anywhere}
-.tag{font-size:11px;font-weight:600;padding:1px 7px;border-radius:10px;white-space:nowrap;margin-right:4px}
-.t-merged{background:var(--ok-soft);color:var(--ok)}.t-draft{background:var(--line);color:var(--muted)}
-.t-open{background:var(--accent-soft);color:var(--accent)}.t-wait{background:var(--warn-soft);color:var(--warn)}
-.t-closed{background:var(--bad-soft);color:var(--bad)}
-.empty{color:var(--muted);font-size:14px;margin:0}
-details summary{cursor:pointer;color:var(--muted);font-size:13px}
-details ul{margin:6px 0 0;padding-left:18px;font-size:13px}
-.people{display:grid;gap:12px}
-.person{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:14px 18px}
-.person h4{margin:0 0 8px;font-size:16px}.person h4 a{color:var(--text)}
-.person dl{margin:0;display:grid;grid-template-columns:110px 1fr;gap:6px 12px}
-.person dt{color:var(--muted);font-size:13px;padding-top:1px}.person dd{margin:0;min-width:0}
-.person.idle{color:var(--muted)}
-table{border-collapse:collapse;width:100%;background:var(--surface);border:1px solid var(--line);border-radius:8px;font-size:14px}
-th,td{padding:8px 10px;border-top:1px solid var(--line);text-align:right;white-space:nowrap}
-th{font-weight:600;color:var(--muted);font-size:12px;border-top:0}
-th:first-child,td:first-child{text-align:left}
-.scroll{overflow-x:auto}
-.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
-footer{margin-top:44px;color:var(--muted);font-size:12px}
-@media (max-width:560px){.person dl{grid-template-columns:1fr}.person dt{margin-top:6px}.list>li{flex-direction:column;gap:2px}}
-`;
-function renderHtml(report, title = "Repository pulse") {
-  const multi = report.repositories.length > 1;
-  const w = report.window;
-  const range = `${day(w.since)} \u2013 ${day(new Date(Date.parse(w.until) - 1).toISOString())}`;
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${htmlEscape(title)} \xB7 ${htmlEscape(range)}</title>
-<style>${STYLE}</style>
-</head>
-<body>
-<main>
-<header>
-  <h1>${htmlEscape(title)}</h1>
-  <p>${report.repositories.map((r) => `<a href="${htmlEscape(r.url)}">${htmlEscape(r.name)}</a>`).join(" \xB7 ")}</p>
-  <p class="num">${htmlEscape(w.since)} \u2192 ${htmlEscape(w.until)} (${w.days} days, UTC)</p>
-</header>
-${multi ? overview(report) : ""}
-${report.repositories.map((r) => repositorySection2(r, multi)).join("\n")}
-<h2 id="contributors">Contributors</h2>
-${contributors(report.contributors, multi)}
-<h2 id="waiting">Waiting on someone</h2>
-${waiting(report.waiting, multi)}
-<footer>Generated ${htmlEscape(report.generatedAt)} by ${htmlEscape(report.generator.name)} ${htmlEscape(report.generator.version)} from the GitHub API.
-Totals are at generation time; everything else is limited to the window.
-Excluded as bots: ${htmlEscape(report.ignoredUsers.join(", ") || "none")}.
-\u201CWaiting on\u201D is derived by rules from the latest activity.</footer>
-</main>
-</body>
-</html>
-`;
-}
-function overview(report) {
-  const rows = report.repositories.map((r) => {
-    const n = r.numbers;
-    return `<tr><td><a href="#${anchor(r.name)}">${htmlEscape(r.name)}</a></td><td>+${n.issuesOpened} / \u2212${n.issuesClosed}</td><td>+${n.pullRequestsOpened} / ${n.pullRequestsMerged}</td><td>${n.defaultBranchCommits}</td><td>${n.pullRequestBranchCommits}</td><td>${n.comments}</td><td>${n.reviews}</td><td>${r.totals.openIssues}</td><td>${r.totals.openPullRequests}</td><td>${n.newForks}</td></tr>`;
-  }).join("");
-  return `<h2>Overview</h2>
-<div class="scroll"><table><thead><tr><th>Repository</th><th>Issues +/\u2212</th><th>PRs + / merged</th><th>Commits</th><th>PR-branch</th><th>Comments</th><th>Reviews</th><th>Open issues</th><th>Open PRs</th><th>Forks</th></tr></thead>
-<tbody>${rows}</tbody></table></div>`;
-}
-function anchor(name) {
-  return "repo-" + name.replace(/[^A-Za-z0-9]+/g, "-").toLowerCase();
-}
-function ref(item, multi, cls = "ref num") {
-  const label = multi ? `${item.repository.split("/")[1]}#${item.number}` : `#${item.number}`;
-  return `<a class="${cls}" href="${htmlEscape(item.url)}">${htmlEscape(label)}</a>`;
-}
-function itemUrl(repo, number) {
-  return `https://github.com/${repo}/issues/${number}`;
-}
-function list(items, emptyText = "None.") {
-  return items.length ? `<ul class="list">${items.join("")}</ul>` : `<p class="empty">${htmlEscape(emptyText)}</p>`;
-}
-function li(refHtml, body) {
-  return `<li>${refHtml}<div class="body">${body}</div></li>`;
-}
-function excerptHtml(text) {
-  return text ? `<div class="excerpt">${htmlEscape(text.length > 220 ? text.slice(0, 219) + "\u2026" : text)}</div>` : "";
-}
-function repositorySection2(repo, multi) {
-  const n = repo.numbers;
-  const t = repo.totals;
-  const stats = `<div class="stats">
-  <div class="stat"><div class="v">+${n.issuesOpened} / \u2212${n.issuesClosed}</div><div class="l">Issues opened / closed</div><div class="d">${t.openIssues} open</div></div>
-  <div class="stat"><div class="v">+${n.pullRequestsOpened} / ${n.pullRequestsMerged}</div><div class="l">PRs opened / merged</div><div class="d">${t.openPullRequests} open${n.pullRequestsClosedUnmerged ? ` \xB7 ${n.pullRequestsClosedUnmerged} closed unmerged` : ""}</div></div>
-  <div class="stat"><div class="v">${n.defaultBranchCommits}</div><div class="l">Commits on ${htmlEscape(repo.defaultBranch)}</div><div class="d">${htmlEscape(commitAuthors(repo.commits.defaultBranch) || "\u2014")}</div></div>
-  <div class="stat"><div class="v">${n.comments} / ${n.reviews}</div><div class="l">Comments / reviews</div><div class="d">${n.pullRequestBranchCommits} commits on PR branches</div></div>
-  <div class="stat"><div class="v">${n.newForks}</div><div class="l">New forks</div><div class="d">${t.forks} total \xB7 ${t.stars} stars</div></div>
-</div>`;
-  const merged = repo.pullRequests.merged.map(
-    (p) => li(
-      ref(p, multi),
-      `<span class="tag t-merged">merged</span>${htmlEscape(p.title)} <span class="meta">\xB7 ${htmlEscape(p.author)} \xB7 into <code>${htmlEscape(p.baseRef)}</code> \xB7 +${p.additions}/\u2212${p.deletions}, ${p.changedFiles} files${p.mergedBy && p.mergedBy !== p.author ? ` \xB7 merged by ${htmlEscape(p.mergedBy)}` : ""}</span>${commitDetails(repo.commits.defaultBranch.filter((c) => c.pullRequest === p.number))}`
-    )
-  );
-  const mergedNumbers = new Set(repo.pullRequests.merged.map((p) => p.number));
-  const direct = /* @__PURE__ */ new Map();
-  for (const c of repo.commits.defaultBranch) {
-    if (c.pullRequest && mergedNumbers.has(c.pullRequest)) continue;
-    const key = c.pullRequest ? `#${c.pullRequest}` : c.author;
-    direct.set(key, [...direct.get(key) ?? [], c]);
-  }
-  for (const [key, commits] of direct) {
-    const label = key.startsWith("#") ? `${commits.length} commit${commits.length > 1 ? "s" : ""} from <a href="${htmlEscape(itemUrl(repo.name, Number(key.slice(1))))}">${htmlEscape(key)}</a>` : `${commits.length} direct commit${commits.length > 1 ? "s" : ""} by ${htmlEscape(key)}`;
-    merged.push(li(`<span class="ref num meta">direct</span>`, `${label}${commitDetails(commits, true)}`));
-  }
-  const opened = [
-    ...repo.pullRequests.opened.map((p) => {
-      const state = p.state === "open" ? p.draft ? '<span class="tag t-draft">draft PR</span>' : '<span class="tag t-open">PR</span>' : p.mergedAt ? '<span class="tag t-merged">merged</span>' : '<span class="tag t-closed">closed</span>';
-      const reviewers = [...p.requestedReviewers, ...p.requestedTeams];
-      return li(
-        ref(p, multi),
-        `${state}${htmlEscape(p.title)} <span class="meta">\xB7 ${htmlEscape(p.author)} \xB7 +${p.additions}/\u2212${p.deletions}, ${p.changedFiles} files${reviewers.length ? ` \xB7 review: ${htmlEscape(reviewers.join(", "))}` : ""}${p.headRepository ? ` \xB7 from ${htmlEscape(p.headRepository)}` : ""}</span>${excerptHtml(p.bodyExcerpt)}`
-      );
-    }),
-    ...repo.issues.opened.map(
-      (i) => li(
-        ref(i, multi),
-        `${i.state === "closed" ? '<span class="tag t-closed">closed</span>' : ""}${htmlEscape(i.title)} <span class="meta">\xB7 ${htmlEscape(i.author)}${i.labels.length ? ` \xB7 ${htmlEscape(i.labels.join(", "))}` : ""}${i.assignees.length ? ` \xB7 \u2192 ${htmlEscape(i.assignees.join(", "))}` : " \xB7 unassigned"}</span>${excerptHtml(i.bodyExcerpt)}`
-      )
-    )
-  ];
-  const closed = [
-    ...repo.issues.closed.map(
-      (i) => li(ref(i, multi), `${htmlEscape(i.title)} <span class="meta">\xB7 closed by ${htmlEscape(i.closedBy ?? "unknown")}${i.stateReason && i.stateReason !== "completed" ? ` (${htmlEscape(i.stateReason.replace(/_/g, " "))})` : ""} \xB7 opened ${htmlEscape(day(i.createdAt))}</span>`)
-    ),
-    ...repo.pullRequests.closedUnmerged.map(
-      (p) => li(ref(p, multi), `<span class="tag t-closed">PR not merged</span>${htmlEscape(p.title)} <span class="meta">\xB7 ${htmlEscape(p.author)}</span>`)
-    )
-  ];
-  const branchGroups = /* @__PURE__ */ new Map();
-  for (const c of repo.commits.pullRequestBranches) branchGroups.set(c.pullRequest, [...branchGroups.get(c.pullRequest) ?? [], c]);
-  const progress = [...branchGroups].map(([number, commits]) => {
-    const p = [...repo.pullRequests.opened, ...repo.pullRequests.updated, ...repo.pullRequests.closedUnmerged].find((x) => x.number === number);
-    return li(
-      ref({ repository: repo.name, number, url: p?.url ?? itemUrl(repo.name, number) }, multi),
-      `${htmlEscape(p?.title ?? "")} <span class="meta">\xB7 ${commits.length} new commit${commits.length > 1 ? "s" : ""} by ${htmlEscape([...new Set(commits.map((c) => c.author))].join(", "))}</span>${commitDetails(commits)}`
-    );
-  });
-  const discussions = repo.discussions.slice(0, 10).map(
-    (d) => li(
-      ref(d, multi),
-      `${htmlEscape(d.title)} <span class="meta">\xB7 ${d.commentCount} comment${d.commentCount > 1 ? "s" : ""} \xB7 ${htmlEscape(d.participants.map((p) => `${p.login} ${p.comments}`).join(", "))}</span>`
-    )
-  );
-  const extra = [];
-  if (repo.forks.length) {
-    extra.push(`<h3>New forks</h3>${list(repo.forks.map((f) => li(`<span class="ref num meta">${htmlEscape(day(f.createdAt))}</span>`, `<a href="${htmlEscape(f.url)}">${htmlEscape(f.fullName)}</a>`)))}`);
-  }
-  if (repo.releases.length) {
-    extra.push(`<h3>Releases</h3>${list(repo.releases.map((r) => li(`<a class="ref num" href="${htmlEscape(r.url)}">${htmlEscape(r.tag)}</a>`, `${htmlEscape(r.name)} <span class="meta">\xB7 ${htmlEscape(r.author)} \xB7 ${htmlEscape(day(r.publishedAt))}${r.prerelease ? " \xB7 pre-release" : ""}</span>`)))}`);
-  }
-  return `<h2 id="${anchor(repo.name)}">${multi ? `<a href="${htmlEscape(repo.url)}">${htmlEscape(repo.name)}</a>` : "Numbers"}</h2>
-${stats}
-<h3>Merged / pushed to ${htmlEscape(repo.defaultBranch)}</h3>
-${list(merged)}
-<h3>Opened</h3>
-${list(opened)}
-<h3>Closed</h3>
-${list(closed)}
-${progress.length ? `<h3>Progress on open pull requests</h3>${list(progress)}` : ""}
-<h3>Discussions</h3>
-${list(discussions, "No human comments in the window.")}
-${extra.join("\n")}`;
-}
-function commitAuthors(commits) {
-  const counts = /* @__PURE__ */ new Map();
-  for (const c of commits) counts.set(c.author, (counts.get(c.author) ?? 0) + 1);
-  return [...counts].sort((a, b) => b[1] - a[1]).map(([a, n]) => `${a} ${n}`).join(" \xB7 ");
-}
-function commitDetails(commits, open = false) {
-  if (!commits.length) return "";
-  const items = commits.map((c) => `<li><a class="num" href="${htmlEscape(c.url)}">${htmlEscape(c.sha.slice(0, 7))}</a> ${htmlEscape(c.message)} <span class="meta">\xB7 ${htmlEscape(c.author)} \xB7 ${htmlEscape(day(c.date))}</span></li>`).join("");
-  return `<details${open ? " open" : ""}><summary>${commits.length} commit${commits.length > 1 ? "s" : ""}</summary><ul>${items}</ul></details>`;
-}
-function refs(items, multi) {
-  return items.map((i) => `${ref(i, multi, "num")} ${htmlEscape(i.title)}`).join("<br>");
-}
-function contributors(people, multi) {
-  if (!people.length) return '<p class="empty">No activity.</p>';
-  return `<div class="people">${people.map((c) => {
-    const rows = [];
-    if (multi) rows.push(`<dt>Repositories</dt><dd>${htmlEscape(c.repositories.join(", "))}</dd>`);
-    if (c.commits.length) {
-      const viaPr = c.commits.filter((x) => x.pullRequest).length;
-      rows.push(
-        `<dt>Commits</dt><dd>${c.commits.length}${viaPr ? ` (${viaPr} via pull requests)` : ""}${commitDetails(c.commits)}</dd>`
-      );
-    }
-    const prs = [];
-    if (c.pullRequestsOpened.length) prs.push(`Opened: ${refs(c.pullRequestsOpened, multi)}`);
-    if (c.pullRequestsMerged.length) prs.push(`Merged: ${refs(c.pullRequestsMerged, multi)}`);
-    if (c.pullRequestsMergedForOthers.length) prs.push(`Merged for others: ${refs(c.pullRequestsMergedForOthers, multi)}`);
-    if (prs.length) rows.push(`<dt>Pull requests</dt><dd>${prs.join("<br>")}</dd>`);
-    if (c.reviews.length) {
-      rows.push(`<dt>Reviews</dt><dd>${c.reviews.map((r) => `${ref(r, multi, "num")} ${htmlEscape(r.state.toLowerCase().replace("_", " "))}`).join(" \xB7 ")}</dd>`);
-    }
-    const issues = [];
-    if (c.issuesOpened.length) issues.push(`Opened: ${refs(c.issuesOpened, multi)}`);
-    if (c.issuesClosed.length) issues.push(`Closed: ${refs(c.issuesClosed, multi)}`);
-    if (issues.length) rows.push(`<dt>Issues</dt><dd>${issues.join("<br>")}</dd>`);
-    if (c.comments.length) {
-      rows.push(`<dt>Comments</dt><dd>${c.comments.map((x) => `${ref(x, multi, "num")}${x.count > 1 ? ` \xD7${x.count}` : ""}`).join(" \xB7 ")}</dd>`);
-    }
-    if (c.waitingOn.length) rows.push(`<dt>Expected to act</dt><dd>${c.waitingOn.map((x) => ref(x, multi, "num")).join(" \xB7 ")}</dd>`);
-    const name = c.isLogin ? `<a href="https://github.com/${htmlEscape(c.login)}">${htmlEscape(c.login)}</a>` : `${htmlEscape(c.login)} <span class="meta">(git author)</span>`;
-    return `<div class="person${c.activity === 0 ? " idle" : ""}"><h4>${name}</h4>${c.activity === 0 ? '<p class="empty">No activity in the window.</p>' : ""}<dl>${rows.join("")}</dl></div>`;
-  }).join("")}</div>`;
-}
-function waiting(items, multi) {
-  if (!items.length) return '<p class="empty">Nothing detected.</p>';
-  const counts = /* @__PURE__ */ new Map();
-  for (const item of items) for (const u of item.waitingOn) counts.set(u, (counts.get(u) ?? 0) + 1);
-  const chips = [...counts].sort((a, b) => b[1] - a[1]).map(([u, n]) => `<span class="tag t-wait">${htmlEscape(u)} ${n}</span>`).join("");
-  const rows = items.map((item) => {
-    const who = item.waitingOn.length ? item.waitingOn.join(", ") : "nobody assigned";
-    return li(
-      ref(item, multi),
-      `<span class="tag t-wait">${htmlEscape(who)}</span>${item.kind === "pull" ? '<span class="tag t-open">PR</span>' : ""}${htmlEscape(item.title)} <span class="meta">\xB7 since ${htmlEscape(day(item.since))}</span><div class="excerpt">${item.reasons.map((r) => htmlEscape(r.detail)).join(" \xB7 ")}</div>`
-    );
-  });
-  return `<div class="chips">${chips}</div>${list(rows)}`;
-}
-
 // src/components/json.ts
-import { writeFile as writeFile3 } from "node:fs/promises";
+import { mkdir as mkdir3, writeFile as writeFile3 } from "node:fs/promises";
 import { join as join3 } from "node:path";
 var jsonComponent = {
   name: "json",
-  description: "Structured report as pulse.json (schema in documentation/json-output.md).",
+  description: "Structured report as pulse/DATE.json (schema in documentation/json-output.md).",
   async run(report, { outputDirectory }) {
-    const file = join3(outputDirectory, "pulse.json");
+    const file = join3(outputDirectory, reportPath("json", reportDate(report.window)));
+    await mkdir3(join3(file, ".."), { recursive: true });
     await writeFile3(file, JSON.stringify(report, null, 2) + "\n");
     return [file];
   }
@@ -529,11 +408,11 @@ var stepSummaryComponent = {
 };
 
 // src/components/index.ts
-var COMPONENTS = [jsonComponent, htmlComponent, agentComponent, stepSummaryComponent];
+var COMPONENTS = [jsonComponent, agentComponent, stepSummaryComponent];
 var COMPONENT_NAMES = COMPONENTS.map((c) => c.name);
 
 // src/config.ts
-var DEFAULT_COMPONENTS = ["json", "html", "agent"];
+var DEFAULT_COMPONENTS = ["json", "agent"];
 function parseList(value) {
   if (!value) return [];
   return value.split(/[\n,]/).map((item) => item.replace(/#.*$/, "").replace(/^\s*-\s+/, "").trim()).filter(Boolean);
@@ -571,11 +450,39 @@ function parseWindow(raw, now = /* @__PURE__ */ new Date()) {
     days: Math.round((until.getTime() - since.getTime()) / 864e5 * 100) / 100
   };
 }
+function parseLimit(value, name) {
+  const trimmed = value?.trim();
+  if (!trimmed) return -1;
+  const number = Number(trimmed);
+  if (!Number.isInteger(number) || number < 1 && number !== -1) {
+    throw new Error(`Invalid ${name} "${value}". Use a whole number of at least 1, or -1 to keep everything.`);
+  }
+  return number;
+}
+function parseRestoreUrl(value) {
+  const trimmed = value?.trim();
+  if (!trimmed) return void 0;
+  if (!/^https?:\/\/[^\s/]+/i.test(trimmed)) throw new Error(`Invalid restore-url "${value}". Use the address of the published site, starting with https://.`);
+  return trimmed;
+}
+function parseViewer(value) {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed || trimmed.toLowerCase() === "default") return { kind: "default" };
+  if (trimmed.toLowerCase() === "none") return { kind: "none" };
+  if (/^https:\/\//i.test(trimmed)) return { kind: "url", url: trimmed };
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) throw new Error(`Invalid viewer "${value}". URLs must use https.`);
+  return { kind: "file", path: trimmed };
+}
 function buildConfig(raw, knownComponents, now = /* @__PURE__ */ new Date()) {
   const repositories = [...new Set(parseList(raw.repositories).map(parseRepository))];
   if (repositories.length === 0) throw new Error('No repositories given. Set the "repositories" input.');
   const components = parseList(raw.components).map((c) => c.toLowerCase());
   const selected = components.length ? [...new Set(components)] : DEFAULT_COMPONENTS;
+  if (selected.includes("html")) {
+    throw new Error(
+      'The "html" component was replaced by the viewer: reports are now pulse/DATE.json and pulse/DATE.md, and index.html is a viewer that renders the JSON in the browser. Remove "html" from components; see the "viewer" input.'
+    );
+  }
   const unknown = selected.filter((c) => !knownComponents.includes(c));
   if (unknown.length) {
     throw new Error(`Unknown component(s): ${unknown.join(", ")}. Available: ${knownComponents.join(", ")}.`);
@@ -588,7 +495,10 @@ function buildConfig(raw, knownComponents, now = /* @__PURE__ */ new Date()) {
     token: raw.token?.trim() || void 0,
     apiUrl: raw["api-url"]?.trim() || void 0,
     ignoreUsers: parseList(raw["ignore-users"]),
-    title: raw.title?.trim() || "Repository pulse"
+    title: raw.title?.trim() || "Repository pulse",
+    retention: { days: parseLimit(raw["history-days"], "history-days"), count: parseLimit(raw["history-count"], "history-count") },
+    viewer: parseViewer(raw.viewer),
+    restoreUrl: parseRestoreUrl(raw["restore-url"])
   };
 }
 function makeIgnoreFilter(extra) {
@@ -605,7 +515,47 @@ function makeIgnoreFilter(extra) {
 }
 
 // src/run.ts
-import { mkdir } from "node:fs/promises";
+import { mkdir as mkdir4 } from "node:fs/promises";
+
+// src/viewer.ts
+import { readFile as readFile2, writeFile as writeFile4 } from "node:fs/promises";
+import { join as join4 } from "node:path";
+var BUNDLED_VIEWER = new URL("../viewer/pulse-viewer.js", import.meta.url);
+function inlineSafe(source) {
+  return source.replace(/<\/(script)/gi, "<\\/$1").replace(/<!--/g, "<\\!--");
+}
+function renderViewerPage(title, script) {
+  const tag = "inline" in script ? `<script type="module">
+${inlineSafe(script.inline)}
+</script>` : `<script type="module" src="${htmlEscape(script.url)}"></script>`;
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="pulse-manifest" content="${MANIFEST_FILE}">
+<title>${htmlEscape(title)}</title>
+</head>
+<body>
+${tag}
+</body>
+</html>
+`;
+}
+async function writeViewer(directory, title, viewer) {
+  if (viewer.kind === "none") return null;
+  let page;
+  if (viewer.kind === "url") page = renderViewerPage(title, { url: viewer.url });
+  else {
+    const source = await readFile2(viewer.kind === "file" ? viewer.path : BUNDLED_VIEWER, "utf8").catch((error) => {
+      throw new Error(`Cannot read the viewer ${viewer.kind === "file" ? viewer.path : "bundled with the action"}: ${error.message}`);
+    });
+    page = renderViewerPage(title, { inline: source });
+  }
+  const file = join4(directory, "index.html");
+  await writeFile4(file, page);
+  return file;
+}
 
 // src/analyze.ts
 function computeWaiting(input2) {
@@ -697,7 +647,7 @@ function computeWaiting(input2) {
   };
 }
 var WEIGHTS = { commit: 1, prOpened: 3, prMerged: 3, mergedForOthers: 1, review: 2, issueOpened: 2, issueClosed: 1, comment: 1 };
-function buildContributors(repositories, waiting2 = []) {
+function buildContributors(repositories, waiting = []) {
   const people = /* @__PURE__ */ new Map();
   const person = (login, isLogin = true) => {
     let c = people.get(login);
@@ -725,7 +675,7 @@ function buildContributors(repositories, waiting2 = []) {
   const touch = (c, repo) => {
     if (!c.repositories.includes(repo)) c.repositories.push(repo);
   };
-  const ref2 = (item) => ({
+  const ref = (item) => ({
     repository: item.repository,
     number: item.number,
     title: item.title,
@@ -740,21 +690,21 @@ function buildContributors(repositories, waiting2 = []) {
     }
     for (const pr of repo.pullRequests.opened) {
       const c = person(pr.author);
-      c.pullRequestsOpened.push(ref2(pr));
+      c.pullRequestsOpened.push(ref(pr));
       touch(c, repo.name);
     }
     for (const pr of repo.pullRequests.merged) {
       const c = person(pr.author);
-      c.pullRequestsMerged.push(ref2(pr));
+      c.pullRequestsMerged.push(ref(pr));
       touch(c, repo.name);
       if (pr.mergedBy && pr.mergedBy !== pr.author) {
         const m = person(pr.mergedBy);
-        m.pullRequestsMergedForOthers.push(ref2(pr));
+        m.pullRequestsMergedForOthers.push(ref(pr));
         touch(m, repo.name);
       }
     }
     const allPulls = /* @__PURE__ */ new Map();
-    for (const list2 of Object.values(repo.pullRequests)) for (const pr of list2) allPulls.set(pr.number, pr);
+    for (const list of Object.values(repo.pullRequests)) for (const pr of list) allPulls.set(pr.number, pr);
     for (const pr of allPulls.values()) {
       const byReviewer = /* @__PURE__ */ new Map();
       for (const review of pr.reviews) {
@@ -764,34 +714,34 @@ function buildContributors(repositories, waiting2 = []) {
       for (const [login, reviews] of byReviewer) {
         const c = person(login);
         const decisive = reviews.filter((r) => r.state === "APPROVED" || r.state === "CHANGES_REQUESTED").at(-1);
-        c.reviews.push({ ...ref2(pr), state: (decisive ?? reviews.at(-1)).state, count: reviews.length });
+        c.reviews.push({ ...ref(pr), state: (decisive ?? reviews.at(-1)).state, count: reviews.length });
         touch(c, repo.name);
       }
     }
     for (const issue of repo.issues.opened) {
       const c = person(issue.author);
-      c.issuesOpened.push(ref2(issue));
+      c.issuesOpened.push(ref(issue));
       touch(c, repo.name);
     }
     for (const issue of repo.issues.closed) {
       if (!issue.closedBy) continue;
       const c = person(issue.closedBy);
-      c.issuesClosed.push(ref2(issue));
+      c.issuesClosed.push(ref(issue));
       touch(c, repo.name);
     }
     for (const discussion of repo.discussions) {
       for (const participant of discussion.participants) {
         const c = person(participant.login);
-        c.comments.push({ ...ref2(discussion), count: participant.comments });
+        c.comments.push({ ...ref(discussion), count: participant.comments });
         touch(c, repo.name);
       }
     }
   }
-  for (const item of waiting2) {
+  for (const item of waiting) {
     for (const login of item.waitingOn) {
       if (login.includes("/")) continue;
       const c = person(login);
-      c.waitingOn.push(ref2(item));
+      c.waitingOn.push(ref(item));
       touch(c, item.repository);
     }
   }
@@ -851,7 +801,7 @@ async function collectRepository(name, ctx) {
   }
   const windowReviews = /* @__PURE__ */ new Map();
   for (const [number, detail] of details) {
-    const list2 = detail.reviews.filter((r) => r.state !== "PENDING" && human(r.user) && inWindow(r.submitted_at, window)).map(
+    const list = detail.reviews.filter((r) => r.state !== "PENDING" && human(r.user) && inWindow(r.submitted_at, window)).map(
       (r) => ({
         author: r.user.login,
         state: r.state,
@@ -860,7 +810,7 @@ async function collectRepository(name, ctx) {
         bodyExcerpt: excerpt(r.body)
       })
     );
-    windowReviews.set(number, list2);
+    windowReviews.set(number, list);
   }
   const shaToPull = /* @__PURE__ */ new Map();
   const pullOrder = [...details.values()].sort(
@@ -975,12 +925,12 @@ async function collectRepository(name, ctx) {
     }
   }
   const discussions = [];
-  for (const [number, list2] of discussionComments) {
+  for (const [number, list] of discussionComments) {
     const item = byNumber.get(number);
     if (!item) continue;
-    list2.sort(byTime((c) => c.createdAt));
+    list.sort(byTime((c) => c.createdAt));
     const counts = /* @__PURE__ */ new Map();
-    for (const c of list2) counts.set(c.author, (counts.get(c.author) ?? 0) + 1);
+    for (const c of list) counts.set(c.author, (counts.get(c.author) ?? 0) + 1);
     discussions.push({
       repository: name,
       number,
@@ -988,9 +938,9 @@ async function collectRepository(name, ctx) {
       title: item.title,
       url: item.html_url,
       state: item.state,
-      commentCount: list2.length,
+      commentCount: list.length,
       participants: [...counts].map(([login, n]) => ({ login, comments: n })).sort((a, b) => b.comments - a.comments),
-      recentComments: list2.slice(-5).map(({ author, createdAt, url, bodyExcerpt, mentions: m }) => ({
+      recentComments: list.slice(-5).map(({ author, createdAt, url, bodyExcerpt, mentions: m }) => ({
         author,
         createdAt,
         url,
@@ -1000,23 +950,23 @@ async function collectRepository(name, ctx) {
     });
   }
   discussions.sort((a, b) => b.commentCount - a.commentCount || b.number - a.number);
-  const waiting2 = [];
+  const waiting = [];
   const activityFor = (number) => {
-    const list2 = (discussionComments.get(number) ?? []).filter((c) => !c.url.includes("#pullrequestreview-")).map((c) => ({ type: "comment", actor: c.author, at: c.createdAt, mentions: c.mentions }));
+    const list = (discussionComments.get(number) ?? []).filter((c) => !c.url.includes("#pullrequestreview-")).map((c) => ({ type: "comment", actor: c.author, at: c.createdAt, mentions: c.mentions }));
     const detail = details.get(number);
     if (detail) {
       for (const r of detail.reviews) {
         if (r.state === "PENDING" || !human(r.user) || ts(r.submitted_at) >= ts(window.until)) continue;
-        list2.push({ type: "review", actor: r.user.login, at: r.submitted_at, reviewState: r.state, mentions: mentions(r.body) });
+        list.push({ type: "review", actor: r.user.login, at: r.submitted_at, reviewState: r.state, mentions: mentions(r.body) });
       }
       for (const c of detail.commits) {
         const author = commitAuthor(c);
         const at = c.commit?.committer?.date;
         if (!author.isLogin || ts(at) >= ts(window.until)) continue;
-        list2.push({ type: "commit", actor: author.author, at });
+        list.push({ type: "commit", actor: author.author, at });
       }
     }
-    return list2;
+    return list;
   };
   for (const i of issues) {
     if (i.state !== "open") continue;
@@ -1036,14 +986,14 @@ async function collectRepository(name, ctx) {
       requestedTeams: [],
       activity: activityFor(i.number)
     });
-    if (item) waiting2.push(item);
+    if (item) waiting.push(item);
   }
   for (const p of pulls) {
     if (p.state !== "open") continue;
     const active = inWindow(p.createdAt, window) || commentedNumbers.has(p.number) || p.reviews.length > 0 || branchCommitNumbers.has(p.number) || p.requestedReviewers.length + p.requestedTeams.length > 0;
     if (!active) continue;
     const item = computeWaiting({ ...p, kind: "pull", activity: activityFor(p.number) });
-    if (item) waiting2.push(item);
+    if (item) waiting.push(item);
   }
   for (const p of openPulls) {
     if (details.has(p.number) || p.draft) continue;
@@ -1064,9 +1014,9 @@ async function collectRepository(name, ctx) {
       requestedTeams: teams,
       activity: []
     });
-    if (item) waiting2.push(item);
+    if (item) waiting.push(item);
   }
-  waiting2.sort(byTime((w) => w.since));
+  waiting.sort(byTime((w) => w.since));
   const newForks = forks.filter((f) => inWindow(f.created_at, window)).map((f) => ({ fullName: f.full_name, url: f.html_url, owner: f.owner?.login ?? "", createdAt: f.created_at }));
   const newReleases = releases.filter((r) => !r.draft && inWindow(r.published_at, window)).map((r) => ({
     tag: r.tag_name,
@@ -1076,7 +1026,7 @@ async function collectRepository(name, ctx) {
     publishedAt: r.published_at,
     prerelease: !!r.prerelease
   }));
-  const reviewCount = [...windowReviews.values()].reduce((sum, list2) => sum + list2.length, 0);
+  const reviewCount = [...windowReviews.values()].reduce((sum, list) => sum + list.length, 0);
   const report = {
     name,
     url: repo.html_url,
@@ -1115,7 +1065,7 @@ async function collectRepository(name, ctx) {
     forks: newForks,
     releases: newReleases
   };
-  return { report, waiting: waiting2 };
+  return { report, waiting };
 }
 function toComment(c, number) {
   return {
@@ -1252,22 +1202,22 @@ function sleep(ms) {
   return new Promise((resolve2) => setTimeout(resolve2, ms));
 }
 
-// src/model.ts
-var SCHEMA_VERSION = 1;
-
 // src/run.ts
-var VERSION = "0.1.0";
+var VERSION = "0.2.0";
 async function run(config, log = console.log) {
+  await mkdir4(config.outputDirectory, { recursive: true });
+  if (config.restoreUrl) await restoreFromUrl(config.restoreUrl, config.outputDirectory, log);
+  const previous = await dropMissing(await loadManifest(config.outputDirectory), config.outputDirectory, log);
   const gh = new GitHubClient({ token: config.token, apiUrl: config.apiUrl, log });
   const { isIgnored, seen } = makeIgnoreFilter(config.ignoreUsers);
   const repositories = [];
-  const waiting2 = [];
+  const waiting = [];
   for (const name of config.repositories) {
     const result = await collectRepository(name, { gh, window: config.window, isIgnored, log });
     repositories.push(result.report);
-    waiting2.push(...result.waiting);
+    waiting.push(...result.waiting);
   }
-  waiting2.sort(byTime((w) => w.since));
+  waiting.sort(byTime((w) => w.since));
   const report = {
     schemaVersion: SCHEMA_VERSION,
     generator: { name: "repository-pulse", version: VERSION },
@@ -1275,18 +1225,41 @@ async function run(config, log = console.log) {
     window: config.window,
     ignoredUsers: [...seen].sort(),
     repositories,
-    contributors: buildContributors(repositories, waiting2),
-    waiting: waiting2
+    contributors: buildContributors(repositories, waiting),
+    waiting
   };
-  await mkdir(config.outputDirectory, { recursive: true });
+  const files = await writeOutputs(report, config, previous, log);
+  log(`Done with ${gh.requestCount} GitHub API requests.`);
+  return { report, files, requests: gh.requestCount };
+}
+async function writeOutputs(report, config, previous, log) {
   const files = {};
   for (const name of config.components) {
     const component = COMPONENTS.find((c) => c.name === name);
     files[name] = await component.run(report, { outputDirectory: config.outputDirectory, title: config.title, log });
     for (const file of files[name]) log(`${name}: wrote ${file}`);
   }
-  log(`Done with ${gh.requestCount} GitHub API requests.`);
-  return { report, files, requests: gh.requestCount };
+  const date = reportDate(report.window);
+  const reportFiles = {};
+  if (config.components.includes("json")) reportFiles.json = reportPath("json", date);
+  if (config.components.includes("agent")) reportFiles.markdown = reportPath("markdown", date);
+  if (Object.keys(reportFiles).length === 0) {
+    log("history: neither json nor agent ran, so there is no report to add to the manifest.");
+  } else {
+    const entry = { date, generatedAt: report.generatedAt, title: config.title, window: report.window, files: reportFiles };
+    const { manifest, removed } = prune(upsert(previous, entry), config.retention);
+    await removeReportFiles(config.outputDirectory, removed);
+    for (const r of removed) log(`history: removed ${r.date}`);
+    files.manifest = [await writeManifest(config.outputDirectory, manifest)];
+    log(`history: ${manifest.reports.length} report(s) in the manifest, latest ${manifest.latest}`);
+    if (config.viewer.kind !== "none" && !reportFiles.json) log('viewer: the viewer reads pulse/DATE.json; add "json" to components or it has nothing to show.');
+    const index = await writeViewer(config.outputDirectory, config.title, config.viewer);
+    if (index) {
+      files.viewer = [index];
+      log(`viewer: wrote ${index}`);
+    }
+  }
+  return files;
 }
 
 // src/action.ts
@@ -1300,7 +1273,11 @@ var INPUTS = [
   "token",
   "api-url",
   "ignore-users",
-  "title"
+  "title",
+  "history-days",
+  "history-count",
+  "viewer",
+  "restore-url"
 ];
 function input(name) {
   return process.env[`INPUT_${name.replace(/ /g, "_").toUpperCase()}`];
@@ -1328,8 +1305,9 @@ async function main() {
   setOutput("output-directory", resolve(config.outputDirectory));
   setOutput("files", all.join("\n"));
   setOutput("json-file", result.files.json?.[0] ?? "");
-  setOutput("html-file", result.files.html?.[0] ?? "");
   setOutput("agent-file", result.files.agent?.[0] ?? "");
+  setOutput("manifest-file", result.files.manifest?.[0] ?? "");
+  setOutput("viewer-file", result.files.viewer?.[0] ?? "");
   setOutput("since", config.window.since);
   setOutput("until", config.window.until);
   setOutput("waiting-count", String(result.report.waiting.length));

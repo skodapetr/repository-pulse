@@ -6,6 +6,28 @@
 
 export const SCHEMA_VERSION = 1;
 
+/** Version of manifest.json, see documentation/manifest.md. */
+export const MANIFEST_VERSION = 1;
+
+/** Index of all reports in an output directory. Paths are relative to the manifest. */
+export interface Manifest {
+  schemaVersion: number;
+  /** `date` of the newest report, equal to `reports[0].date`. */
+  latest: string;
+  /** One entry per day, newest first. */
+  reports: ManifestEntry[];
+}
+
+export interface ManifestEntry {
+  /** Day of the end of the report window, YYYY-MM-DD (UTC). One report per day. */
+  date: string;
+  generatedAt: string;
+  title: string;
+  window: TimeWindow;
+  /** Files this report consists of; only the ones that were written. */
+  files: { json?: string; markdown?: string };
+}
+
 export interface Report {
   schemaVersion: number;
   generator: { name: string; version: string };
