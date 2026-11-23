@@ -21,5 +21,12 @@ jobs:
         uses: ./
         with:
           repositories: ${{ github.repository }}
-          components: json, html, agent, step-summary
+          components: json, agent, step-summary
           days: 30
+          output-directory: pulse-output
+      - name: Check the written site
+        run: |
+          test -f pulse-output/index.html
+          test -f pulse-output/pulse.md
+          jq -e '.latest | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")' pulse-output/manifest.json
+          jq -e '.reports[0].files.json' pulse-output/manifest.json

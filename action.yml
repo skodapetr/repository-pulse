@@ -1,5 +1,5 @@
 name: Repository Pulse
-description: Report what happened in a set of repositories over a time window, as a web page, structured JSON and agent-ready Markdown.
+description: Report what happened in a set of repositories over a time window, as structured JSON, agent-ready Markdown and a web viewer, with a history of earlier reports.
 branding:
   icon: activity
   color: blue
@@ -12,10 +12,10 @@ inputs:
     required: true
   components:
     description: >
-      Outputs to produce, in order. Available: json, html, agent, step-summary.
+      Outputs to produce, in order. Available: json, agent, step-summary.
       See the README for what each one writes.
     required: false
-    default: json, html, agent
+    default: json, agent
   days:
     description: Length of the time window in days, ending at `until`. Ignored when `since` is set.
     required: false
@@ -49,6 +49,30 @@ inputs:
     description: Title used in the HTML page, the Markdown file and the step summary.
     required: false
     default: Repository pulse
+  history-days:
+    description: >
+      Delete reports more than this many days older than the newest one. -1 keeps all.
+      Combined with history-count, a report is deleted when either limit says so.
+    required: false
+    default: '-1'
+  history-count:
+    description: Keep only this many of the newest reports. -1 keeps all.
+    required: false
+    default: '-1'
+  viewer:
+    description: >
+      What index.html is. "default" is the viewer bundled with the action, "none" writes
+      no index.html, a path to a JavaScript file is inlined into index.html, and an https
+      URL makes index.html load the viewer from there.
+    required: false
+    default: default
+  restore-url:
+    description: >
+      Address of the published site (for example https://owner.github.io/repo/). Before the
+      run, its manifest and reports are downloaded into output-directory so that the
+      history continues. A missing manifest is treated as a first run.
+    required: false
+    default: ''
 
 outputs:
   output-directory:
@@ -56,11 +80,13 @@ outputs:
   files:
     description: Paths of all files written, one per line.
   json-file:
-    description: Path of pulse.json, when the json component ran.
-  html-file:
-    description: Path of index.html, when the html component ran.
+    description: Path of this run's pulse/DATE.json, when the json component ran.
   agent-file:
-    description: Path of pulse.md, when the agent component ran.
+    description: Path of this run's pulse/DATE.md, when the agent component ran.
+  manifest-file:
+    description: Path of manifest.json.
+  viewer-file:
+    description: Path of index.html, unless viewer is none.
   since:
     description: Resolved start of the window (ISO 8601, UTC).
   until:

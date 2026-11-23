@@ -1,5 +1,6 @@
-import { writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { MANIFEST_FILE, reportDate, reportPath } from '../history.js';
 import type { CommitItem, Contributor, Report, RepositoryReport, WaitingItem } from '../model.js';
 import { day } from '../util.js';
 import type { Component } from './index.js';
@@ -11,13 +12,33 @@ import type { Component } from './index.js';
  */
 export const agentComponent: Component = {
   name: 'agent',
-  description: 'Agent-ready Markdown as pulse.md: all facts, stable references, excerpts of descriptions and comments.',
+  description:
+    'Agent-ready Markdown as pulse/DATE.md (facts, stable references, excerpts) and pulse.md, the instructions for finding the latest report.',
   async run(report, { outputDirectory, title }) {
-    const file = join(outputDirectory, 'pulse.md');
+    const file = join(outputDirectory, reportPath('markdown', reportDate(report.window)));
+    await mkdir(join(file, '..'), { recursive: true });
     await writeFile(file, renderAgentMarkdown(report, title));
-    return [file];
+    const entry = join(outputDirectory, 'pulse.md');
+    await writeFile(entry, renderAgentEntry(title));
+    return [file, entry];
   },
 };
+
+/** Static instructions at the root of the site: they never change between runs. */
+export function renderAgentEntry(title = 'Repository pulse'): string {
+  return `# ${title}: instructions for agents
+
+This site publishes a report of repository activity (issues, pull requests, commits, discussions, contributors and who is waiting on whom) once per day. Each report covers a time window and is kept as a separate file.
+
+To read the latest report:
+
+1. Fetch \`${MANIFEST_FILE}\` from the same directory as this file. It is JSON: \`{ "latest": "YYYY-MM-DD", "reports": [...] }\`, newest report first.
+2. Take \`reports[0]\` (its \`date\` equals \`latest\`). \`window\` gives the period it covers. \`files.markdown\` is the path of the report written for agents, \`files.json\` the same data as structured JSON. Paths are relative to the manifest.
+3. Fetch \`files.markdown\` and base your summary on it. Its first lines explain how to read references and what the totals mean.
+
+To compare with earlier periods, pick other entries in \`reports\` and fetch their files the same way. Not every period has a report, and old ones are removed according to the retention settings, so use the dates listed in the manifest instead of guessing file names.
+`;
+}
 
 const quote = (text: string) => (text ? `  > ${text}` : '');
 
@@ -30,6 +51,7 @@ export function renderAgentMarkdown(report: Report, title = 'Repository pulse'):
     '',
     `- Window: ${w.since} to ${w.until} (${w.days} days, end exclusive, UTC)`,
     `- Generated: ${report.generatedAt} by ${report.generator.name} ${report.generator.version}`,
+    `- All reports: [../${MANIFEST_FILE}](../${MANIFEST_FILE})`,
     `- Repositories: ${report.repositories.map((r) => r.name).join(', ')}`,
     `- Excluded as bots or ignored: ${report.ignoredUsers.join(', ') || 'none'}`,
     '',

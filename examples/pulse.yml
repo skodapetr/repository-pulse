@@ -1,6 +1,8 @@
 # Example consumer workflow: put this in .github/workflows/ of a repository
 # you own (for example a "pulse" repository), enable GitHub Pages with
-# "Source: GitHub Actions", and the report is rebuilt every morning.
+# "Source: GitHub Actions", and a new report is added every morning. The site
+# keeps the reports of the last 90 days: index.html shows the latest one and
+# lets readers move between days.
 
 name: Repository pulse
 
@@ -36,12 +38,16 @@ jobs:
           repositories: |
             dataspecer/dataspecer
             dataspecer/ci-specifications
-          components: json, html, agent, step-summary
+          components: json, agent, step-summary
           days: ${{ inputs.days || '7' }}
           output-directory: site
           title: Dataspecer pulse
+          # The runner starts empty, so earlier reports are downloaded from the
+          # published site first. Replace with the address of your own Pages site.
+          restore-url: https://OWNER.github.io/REPOSITORY/
+          history-days: 90
 
-      # Keep the files of every run for 90 days, so agents can fetch them.
+      # Keep the files of every run for 90 days, so they can be fetched without Pages.
       - name: Keep the files as an artifact
         uses: actions/upload-artifact@v4
         with:
